@@ -14,6 +14,9 @@
  * This is a thin delegating extension: all rewrite logic lives in `rtk rewrite`,
  * which is the single source of truth (src/discover/registry.rs).
  * To add or change rewrite rules, edit the Rust registry — not this file.
+ * When `rtk rewrite` declines a whole multi-line command (it does not rewrite
+ * constructs like `$(...)`), this extension retries line by line — heredoc
+ * bodies and comments are kept verbatim, unrewritable lines pass through.
  *
  * Exit code contract for `rtk rewrite`:
  *   0 + stdout  Rewrite found → mutate command
@@ -102,6 +105,116 @@ async function rewriteCommand(
 	if (result.killed) return null
 	if (result.code !== 0 && result.code !== 3) return null
 	return result.stdout.trim() || null
+}
+
+/** One parsed piece of a multi-line command. */
+interface CommandSegment {
+	/** A shell command line (continuations collapsed into `joined`). */
+	kind: "cmd"
+	/** Exact original text, including embedded "\\\n" continuations. */
+	raw: string
+	/** Continuation-collapsed single line handed to `rtk rewrite`. */
+	joined: string
+}
+
+interface LiteralSegment {
+	kind: "literal"
+	raw: string
+}
+
+type Segment = CommandSegment | LiteralSegment
+
+const HEREDOC_START_RE = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/g
+/** Above this line count the per-line fallback is skipped (pathological input). */
+const MAX_FALLBACK_LINES = 64
+
+function trailingBackslashes(s: string): number {
+	let n = 0
+	for (let i = s.length - 1; i >= 0 && s[i] === "\\"; i--) n++
+	return n
+}
+
+/**
+ * Split a multi-line command into segments: heredoc bodies and comments stay
+ * literal; everything else becomes one segment per logical command, with
+ * "\\\n" continuations collapsed so `rtk rewrite` sees a single line.
+ */
+export function splitCommandSegments(cmd: string): Segment[] {
+	const rawLines = cmd.split("\n")
+	const segments: Segment[] = []
+	const heredocTerminators: string[] = []
+	let i = 0
+	while (i < rawLines.length) {
+		const line = rawLines[i]
+		const trimmed = line.trim()
+		// Inside a heredoc: pass through until the terminator line.
+		if (heredocTerminators.length > 0) {
+			segments.push({ kind: "literal", raw: line })
+			if (trimmed === heredocTerminators[heredocTerminators.length - 1]) heredocTerminators.pop()
+			i++
+			continue
+		}
+		// Blank or comment-only lines carry nothing to rewrite.
+		if (trimmed === "" || trimmed.startsWith("#")) {
+			segments.push({ kind: "literal", raw: line })
+			i++
+			continue
+		}
+		// Collect continuation lines (odd number of trailing backslashes).
+		let raw = line
+		while (i + 1 < rawLines.length && trailingBackslashes(raw) % 2 === 1 && i + 1 < rawLines.length) {
+			i++
+			raw += "\n" + rawLines[i]
+		}
+		// Collapse "\\\n" (plus surrounding spaces) into a single space.
+		const joined = raw.replace(/\\\n\s*/g, " ")
+		segments.push({ kind: "cmd", raw, joined })
+		// A heredoc on this line makes the following lines body text.
+		HEREDOC_START_RE.lastIndex = 0
+		let m: RegExpExecArray | null
+		while ((m = HEREDOC_START_RE.exec(joined)) !== null) {
+			heredocTerminators.push(m[2])
+		}
+		i++
+	}
+	return segments
+}
+
+/**
+ * Rewrite a bash command via `rtk rewrite`. Tries the whole command first;
+ * when rtk declines (e.g. the command contains `$(...)`) and the command is
+ * multi-line, falls back to rewriting it line by line — heredoc bodies and
+ * comments are left untouched, lines rtk cannot rewrite are kept verbatim.
+ * Returns null when nothing changed (pass through).
+ */
+async function rewriteCommandSmart(
+	pi: ExtensionAPI,
+	cmd: string,
+	signal?: AbortSignal
+): Promise<string | null> {
+	const whole = await rewriteCommand(pi, cmd, signal)
+	if (whole !== null) return whole
+	// Exit 1 on a single-line command: no rewrite, same as before.
+	if (!cmd.includes("\n")) return null
+	if (cmd.split("\n").length > MAX_FALLBACK_LINES) return null
+
+	const segments = splitCommandSegments(cmd)
+	const out: string[] = []
+	let changed = false
+	for (const seg of segments) {
+		if (seg.kind === "literal") {
+			out.push(seg.raw)
+			continue
+		}
+		const rewritten = await rewriteCommand(pi, seg.joined, signal)
+		if (rewritten !== null && rewritten !== seg.joined) {
+			changed = true
+			out.push(rewritten)
+		} else {
+			out.push(seg.raw)
+		}
+	}
+	return changed ? out.join("\n") : null
 }
 
 function parseGain(stdout: string): Totals | null {
@@ -240,8 +353,9 @@ export default async function (pi: ExtensionAPI) {
 			if (!enabled) return
 			if (process.env.RTK_DISABLED === "1") return
 
-			// Delegate to RTK.
-			const rewritten = await rewriteCommand(pi, cmd, ctx.signal)
+			// Delegate to RTK. Falls back to per-line rewriting for multi-line
+			// scripts rtk declines as a whole (e.g. because of `$(...)`).
+			const rewritten = await rewriteCommandSmart(pi, cmd, ctx.signal)
 			if (rewritten && rewritten !== cmd) {
 				event.input.command = rewritten
 				rewrites += 1

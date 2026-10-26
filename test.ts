@@ -191,6 +191,32 @@ await reg.commands.rtk.handler("saved", fakeCtx);
 const card2 = reg.entries.at(-1)?.data as typeof card;
 check("reset clamps session delta to zero", card2?.session?.saved === 0 && card2.session.commands === 0);
 
+// Multi-line scripts: rtk declines the whole command ($(pwd) is not a
+// rewritable construct), so the extension retries line by line; the line rtk
+// cannot rewrite passes through verbatim.
+rtk.rewrites!["uv run pytest -q 2>&1 | tail -n 2"] = "uv run rtk pytest -q 2>&1 | tail -n 2";
+const declinedScript = "export PYTHONPATH=$PYTHONPATH:$(pwd)/src\nuv run pytest -q 2>&1 | tail -n 2";
+check(
+	"rewrites lines of a declined script",
+	(await runBash(reg, declinedScript)) ===
+		"export PYTHONPATH=$PYTHONPATH:$(pwd)/src\nuv run rtk pytest -q 2>&1 | tail -n 2",
+);
+
+// Heredoc bodies are data: never rewritten even when a rule matches.
+rtk.rewrites!["uv run pytest -q"] = "uv run rtk pytest -q";
+const heredoc = "python3 - <<'PY'\nuv run pytest -q\nPY";
+check("leaves heredoc bodies alone", (await runBash(reg, heredoc)) === heredoc);
+
+// Continuation lines are collapsed into one command, rewritten, emitted as one line.
+rtk.rewrites!["cd /x &&  git status"] = "cd /x && rtk git status";
+check(
+	"rewrites continued command",
+	(await runBash(reg, "cd /x && \\\ngit status")) === "cd /x && rtk git status",
+);
+
+// A single-line command rtk declines still passes through untouched.
+check("single-line decline passes through", (await runBash(reg, "echo $(date)")) === "echo $(date)");
+
 // Unavailable rtk: factory bails before registering the rewrite handler.
 const missing = makeFake({});
 await (activate as (p: unknown) => Promise<void>)(missing.pi);
